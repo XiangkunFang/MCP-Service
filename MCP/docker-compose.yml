@@ -1,0 +1,50 @@
+# ===========================================
+# Google Drive MCP Server - Docker Compose
+# ===========================================
+
+version: '3.8'
+
+services:
+  gdrive-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gdrive-mcp-server
+    restart: unless-stopped
+    
+    ports:
+      - "8000:8000"
+    
+    volumes:
+      # 挂载凭证目录 (必须)
+      # 本地先运行 auth 生成凭证，再启动容器
+      - ./config:/config:ro
+    
+    environment:
+      - GDRIVE_CREDS_DIR=/config
+      - PORT=8000
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # 可选：日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# 后续扩展：可以添加向量数据库
+#   chroma:
+#     image: chromadb/chroma:latest
+#     ports:
+#       - "8001:8000"
+#     volumes:
+#       - chroma_data:/chroma/chroma
+
+# volumes:
+#   chroma_data:
