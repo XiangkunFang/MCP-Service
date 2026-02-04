@@ -13,12 +13,12 @@ services:
     restart: unless-stopped
     
     ports:
-      - "8000:8000"
+      - "8010:8000"
     
     volumes:
       # 挂载凭证目录 (必须)
       # 本地先运行 auth 生成凭证，再启动容器
-      - ./config:/config:ro
+      - ./config:/config
     
     environment:
       - GDRIVE_CREDS_DIR=/config

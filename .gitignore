@@ -1,0 +1,4 @@
+
+# MCP 凭证目录（敏感信息）
+MCP/config/
+MCP/client_secret_*.json

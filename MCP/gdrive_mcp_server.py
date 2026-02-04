@@ -38,7 +38,6 @@ from mcp.types import (
     Resource,
     Tool,
     TextContent,
-    BlobContent,
     CallToolResult,
     ReadResourceResult,
     ListResourcesResult,
@@ -286,11 +285,13 @@ def create_server() -> Server:
                 ]
             )
         else:
+            # 二进制内容用 base64 编码作为文本返回
+            blob_data = content if isinstance(content, str) else base64.b64encode(content).decode()
             return ReadResourceResult(
                 contents=[
-                    BlobContent(
-                        type="blob",
-                        blob=content if isinstance(content, str) else base64.b64encode(content).decode(),
+                    TextContent(
+                        type="text",
+                        text=f"[Base64 Encoded Binary Content]\n{blob_data}",
                     )
                 ]
             )
@@ -628,11 +629,12 @@ async def run_server_http(host: str, port: int):
     app = Starlette(
         debug=False,
         routes=[
-            Route("/", health_check, methods=["GET"]),
             Route("/health", health_check, methods=["GET"]),
             Route("/sse", handle_sse, methods=["GET"]),
             Route("/mcp", handle_message, methods=["POST"]),
             Route("/message", handle_message, methods=["POST"]),  # 兼容别名
+            Route("/", handle_message, methods=["POST"]),  # POST到根路径
+            Route("/", health_check, methods=["GET"]),     # GET根路径仍返回健康检查
         ],
     )
 
