@@ -624,11 +624,22 @@ async def run_server_http(host: str, port: int):
         """健康检查端点"""
         return JSONResponse({"status": "healthy", "server": "gdrive-mcp-server"})
 
+    async def handle_root(request: Request):
+        """
+        根路径处理 - 支持 Streamable HTTP transport
+        - GET: 健康检查
+        - POST: MCP 消息处理
+        """
+        if request.method == "POST":
+            return await handle_message(request)
+        else:
+            return await health_check(request)
+
     # 创建 Starlette 应用
     app = Starlette(
         debug=False,
         routes=[
-            Route("/", health_check, methods=["GET"]),
+            Route("/", handle_root, methods=["GET", "POST"]),
             Route("/health", health_check, methods=["GET"]),
             Route("/sse", handle_sse, methods=["GET"]),
             Route("/mcp", handle_message, methods=["POST"]),
@@ -638,6 +649,7 @@ async def run_server_http(host: str, port: int):
 
     logger.info(f"启动 Google Drive MCP Server (HTTP 模式) - http://{host}:{port}")
     logger.info(f"  - 健康检查: http://{host}:{port}/health")
+    logger.info(f"  - MCP 端点: http://{host}:{port}/ (支持 Streamable HTTP)")
     logger.info(f"  - MCP 端点: http://{host}:{port}/mcp")
     logger.info(f"  - SSE 端点: http://{host}:{port}/sse")
 
