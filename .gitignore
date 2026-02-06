@@ -2,3 +2,9 @@
 # MCP 凭证目录（敏感信息）
 MCP/config/
 MCP/client_secret_*.json
+
+# Google Drive MCP 凭证（敏感信息）
+gdrive-mcp/config/
+gdrive-mcp/client_secret_*.json
+**/credentials.json
+**/gcp-oauth.keys.json
