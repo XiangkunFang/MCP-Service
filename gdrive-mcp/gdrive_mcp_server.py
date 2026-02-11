@@ -53,7 +53,8 @@ logging.basicConfig(
 logger = logging.getLogger("gdrive-mcp")
 
 # Google Drive API 配置
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+# 使用完整的 drive 权限以支持读写操作
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 # 凭证文件路径（可通过环境变量配置）
 CREDENTIALS_DIR = Path(os.getenv("GDRIVE_CREDS_DIR", Path.home() / ".config" / "gdrive-mcp"))
@@ -104,7 +105,7 @@ class GoogleDriveClient:
         return True
 
     def run_auth_flow(self) -> bool:
-        """运行 OAuth 认证流程"""
+        """运行 OAuth 认证流程（支持无浏览器的服务器环境）"""
         if not OAUTH_KEYS_FILE.exists():
             logger.error(f"OAuth 密钥文件不存在: {OAUTH_KEYS_FILE}")
             logger.error("请从 Google Cloud Console 下载 OAuth 2.0 凭证并保存到该路径")
@@ -114,10 +115,43 @@ class GoogleDriveClient:
             # 确保目录存在
             CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
 
+            # 使用 localhost 回调（用户需要从重定向 URL 中复制授权码）
             flow = InstalledAppFlow.from_client_secrets_file(
-                str(OAUTH_KEYS_FILE), SCOPES
+                str(OAUTH_KEYS_FILE), SCOPES,
+                redirect_uri='http://localhost'
             )
-            creds = flow.run_local_server(port=0)
+            
+            # 生成授权 URL
+            auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+            
+            print("\n" + "="*60)
+            print("服务器环境认证模式")
+            print("="*60)
+            print("1. 复制下面的 URL 到浏览器打开：")
+            print()
+            print(auth_url)
+            print()
+            print("2. 登录 Google 账号并授权")
+            print("3. 授权后浏览器会跳转到一个打不开的页面（这是正常的）")
+            print("4. 从浏览器地址栏复制完整的 URL（以 http://localhost:8085/?... 开头）")
+            print("5. 将完整 URL 粘贴到下面")
+            print("="*60)
+            
+            redirect_url = input("\n请粘贴完整的重定向 URL: ").strip()
+            
+            # 从 URL 中提取授权码
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(redirect_url)
+            code = parse_qs(parsed.query).get('code', [None])[0]
+            
+            if not code:
+                logger.error("无法从 URL 中提取授权码")
+                return False
+            
+            # 交换授权码获取凭证
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            
             self._save_credentials(creds)
             logger.info("认证成功！凭证已保存")
             return True
@@ -146,6 +180,42 @@ class GoogleDriveClient:
             return result
         except HttpError as e:
             logger.error(f"列出文件失败: {e}")
+            raise
+
+    async def list_folder(self, folder_id: str | None = None, page_size: int = 50) -> list[dict]:
+        """
+        列出指定文件夹中的文件和子文件夹
+        
+        Args:
+            folder_id: 文件夹ID，None或"root"表示根目录
+            page_size: 返回的最大文件数
+            
+        Returns:
+            文件列表，每个文件包含 id, name, mimeType, 以及是否为文件夹的标识
+        """
+        try:
+            # 如果没有指定folder_id或为"root"，则列出根目录
+            if not folder_id or folder_id == "root":
+                query = "'root' in parents and trashed = false"
+            else:
+                query = f"'{folder_id}' in parents and trashed = false"
+            
+            result = self.service.files().list(
+                q=query,
+                pageSize=page_size,
+                fields="files(id, name, mimeType, size, modifiedTime)",
+                orderBy="folder, name",  # 文件夹优先，然后按名称排序
+            ).execute()
+            
+            files = result.get("files", [])
+            
+            # 添加是否为文件夹的标识
+            for f in files:
+                f["isFolder"] = f.get("mimeType") == "application/vnd.google-apps.folder"
+            
+            return files
+        except HttpError as e:
+            logger.error(f"列出文件夹内容失败: {e}")
             raise
 
     async def get_file_metadata(self, file_id: str) -> dict:
@@ -217,12 +287,130 @@ class GoogleDriveClient:
             return mime_type, base64.b64encode(result).decode("utf-8")
         return mime_type, result
 
-    async def search_files(self, query: str, page_size: int = 10) -> list[dict]:
-        """搜索文件"""
+    async def get_file_tree(self, max_files: int = 500) -> dict:
+        """
+        获取完整的文件系统树状结构快照
+        
+        Args:
+            max_files: 最大获取文件数（避免超大Drive耗时过长）
+            
+        Returns:
+            树状结构的字典，包含完整的目录层级
+        """
+        try:
+            all_files = []
+            page_token = None
+            
+            # 获取所有文件和文件夹（包含parents信息）
+            while len(all_files) < max_files:
+                params = {
+                    "pageSize": min(100, max_files - len(all_files)),
+                    "fields": "nextPageToken, files(id, name, mimeType, parents, size, modifiedTime)",
+                    "q": "trashed = false",
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                
+                result = self.service.files().list(**params).execute()
+                files = result.get("files", [])
+                all_files.extend(files)
+                
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+            
+            # 构建 id -> file 的映射
+            file_map = {f["id"]: f for f in all_files}
+            
+            # 构建树状结构
+            root_children = []
+            children_map = {}  # parent_id -> [children]
+            
+            for f in all_files:
+                f["isFolder"] = f.get("mimeType") == "application/vnd.google-apps.folder"
+                parents = f.get("parents", [])
+                
+                if not parents or "root" in [p for p in parents if p not in file_map]:
+                    # 没有父文件夹，或父文件夹是root
+                    root_children.append(f)
+                else:
+                    # 有父文件夹
+                    for parent_id in parents:
+                        if parent_id not in children_map:
+                            children_map[parent_id] = []
+                        children_map[parent_id].append(f)
+            
+            def build_tree(file_list: list, depth: int = 0, max_depth: int = 10) -> list:
+                """递归构建树"""
+                if depth > max_depth:
+                    return []
+                
+                result = []
+                # 先排序：文件夹优先，然后按名称
+                sorted_files = sorted(file_list, key=lambda x: (not x.get("isFolder"), x.get("name", "")))
+                
+                for f in sorted_files:
+                    node = {
+                        "name": f["name"],
+                        "id": f["id"],
+                        "type": "folder" if f.get("isFolder") else "file",
+                    }
+                    if not f.get("isFolder"):
+                        node["mimeType"] = f.get("mimeType", "unknown")
+                        if f.get("size"):
+                            node["size"] = f["size"]
+                    
+                    # 如果是文件夹，递归获取子项
+                    if f.get("isFolder") and f["id"] in children_map:
+                        node["children"] = build_tree(children_map[f["id"]], depth + 1, max_depth)
+                    
+                    result.append(node)
+                
+                return result
+            
+            tree = build_tree(root_children)
+            
+            # 统计信息
+            folder_count = sum(1 for f in all_files if f.get("isFolder"))
+            file_count = len(all_files) - folder_count
+            
+            return {
+                "tree": tree,
+                "stats": {
+                    "total_items": len(all_files),
+                    "folders": folder_count,
+                    "files": file_count,
+                    "truncated": len(all_files) >= max_files,
+                }
+            }
+            
+        except HttpError as e:
+            logger.error(f"获取文件树失败: {e}")
+            raise
+
+    async def search_files(self, query: str, folder_id: str | None = None, page_size: int = 10) -> list[dict]:
+        """
+        搜索文件
+        
+        Args:
+            query: 搜索关键词
+            folder_id: 可选，限制搜索范围到指定文件夹
+            page_size: 返回的最大文件数
+        """
         try:
             # 转义查询字符串
             escaped_query = query.replace("\\", "\\\\").replace("'", "\\'")
             formatted_query = f"fullText contains '{escaped_query}'"
+            
+            # 如果指定了文件夹，添加父文件夹限制
+            if folder_id:
+                if folder_id == "root":
+                    formatted_query += " and 'root' in parents"
+                else:
+                    formatted_query += f" and '{folder_id}' in parents"
+            
+            # 排除已删除的文件
+            formatted_query += " and trashed = false"
 
             result = self.service.files().list(
                 q=formatted_query,
@@ -235,9 +423,206 @@ class GoogleDriveClient:
             logger.error(f"搜索文件失败: {e}")
             raise
 
+    async def create_file(self, name: str, content: str, folder_id: str | None = None, mime_type: str = "text/plain") -> dict:
+        """
+        创建新文件
+        
+        Args:
+            name: 文件名
+            content: 文件内容
+            folder_id: 父文件夹ID，None 表示根目录
+            mime_type: 文件MIME类型，默认为纯文本
+            
+        Returns:
+            创建的文件信息
+        """
+        try:
+            from googleapiclient.http import MediaInMemoryUpload
+            
+            file_metadata = {"name": name}
+            if folder_id and folder_id != "root":
+                file_metadata["parents"] = [folder_id]
+            
+            # 根据文件扩展名自动设置 MIME 类型
+            if name.endswith(".md"):
+                mime_type = "text/markdown"
+            elif name.endswith(".json"):
+                mime_type = "application/json"
+            elif name.endswith(".html"):
+                mime_type = "text/html"
+            elif name.endswith(".csv"):
+                mime_type = "text/csv"
+            
+            media = MediaInMemoryUpload(
+                content.encode("utf-8"),
+                mimetype=mime_type,
+                resumable=True
+            )
+            
+            file = self.service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, mimeType, webViewLink"
+            ).execute()
+            
+            logger.info(f"文件创建成功: {file['name']} (ID: {file['id']})")
+            return file
+        except HttpError as e:
+            logger.error(f"创建文件失败: {e}")
+            raise
+
+    async def update_file(self, file_id: str, content: str, mime_type: str | None = None) -> dict:
+        """
+        更新文件内容
+        
+        Args:
+            file_id: 文件ID
+            content: 新的文件内容
+            mime_type: 可选，文件MIME类型
+            
+        Returns:
+            更新后的文件信息
+        """
+        try:
+            from googleapiclient.http import MediaInMemoryUpload
+            
+            # 先获取文件信息以确定 MIME 类型
+            if not mime_type:
+                file_info = await self.get_file_metadata(file_id)
+                mime_type = file_info.get("mimeType", "text/plain")
+            
+            media = MediaInMemoryUpload(
+                content.encode("utf-8"),
+                mimetype=mime_type,
+                resumable=True
+            )
+            
+            file = self.service.files().update(
+                fileId=file_id,
+                media_body=media,
+                fields="id, name, mimeType, modifiedTime"
+            ).execute()
+            
+            logger.info(f"文件更新成功: {file['name']} (ID: {file['id']})")
+            return file
+        except HttpError as e:
+            logger.error(f"更新文件失败: {e}")
+            raise
+
+    async def create_folder(self, name: str, parent_folder_id: str | None = None) -> dict:
+        """
+        创建新文件夹
+        
+        Args:
+            name: 文件夹名称
+            parent_folder_id: 父文件夹ID，None 表示根目录
+            
+        Returns:
+            创建的文件夹信息
+        """
+        try:
+            file_metadata = {
+                "name": name,
+                "mimeType": "application/vnd.google-apps.folder"
+            }
+            if parent_folder_id and parent_folder_id != "root":
+                file_metadata["parents"] = [parent_folder_id]
+            
+            folder = self.service.files().create(
+                body=file_metadata,
+                fields="id, name, webViewLink"
+            ).execute()
+            
+            logger.info(f"文件夹创建成功: {folder['name']} (ID: {folder['id']})")
+            return folder
+        except HttpError as e:
+            logger.error(f"创建文件夹失败: {e}")
+            raise
+
+    async def delete_file(self, file_id: str) -> bool:
+        """
+        删除文件或文件夹（移动到回收站）
+        
+        Args:
+            file_id: 文件或文件夹ID
+            
+        Returns:
+            是否删除成功
+        """
+        try:
+            # 使用 trash 而不是永久删除，更安全
+            self.service.files().update(
+                fileId=file_id,
+                body={"trashed": True}
+            ).execute()
+            
+            logger.info(f"文件已移至回收站: {file_id}")
+            return True
+        except HttpError as e:
+            logger.error(f"删除文件失败: {e}")
+            raise
+
+    async def move_file(self, file_id: str, new_parent_id: str) -> dict:
+        """
+        移动文件到新文件夹
+        
+        Args:
+            file_id: 文件ID
+            new_parent_id: 新的父文件夹ID
+            
+        Returns:
+            更新后的文件信息
+        """
+        try:
+            # 获取当前父文件夹
+            file = self.service.files().get(
+                fileId=file_id,
+                fields="parents"
+            ).execute()
+            
+            previous_parents = ",".join(file.get("parents", []))
+            
+            # 移动文件
+            file = self.service.files().update(
+                fileId=file_id,
+                addParents=new_parent_id,
+                removeParents=previous_parents,
+                fields="id, name, parents"
+            ).execute()
+            
+            logger.info(f"文件移动成功: {file['name']}")
+            return file
+        except HttpError as e:
+            logger.error(f"移动文件失败: {e}")
+            raise
+
 
 # 全局客户端实例
 drive_client = GoogleDriveClient()
+
+
+async def get_root_folders_description() -> str:
+    """
+    获取根目录文件夹列表，用于动态生成 inputSchema 的 description
+    这样 LLM 在获取工具列表时就能直接看到可用的文件夹
+    """
+    try:
+        files = await drive_client.list_folder(folder_id="root")
+        folders = [f for f in files if f.get("isFolder")]
+        
+        if not folders:
+            return "Use 'root' for root directory, or omit to list root."
+        
+        # 构建文件夹列表描述
+        folder_list = ", ".join([f"'{f['name']}' (id: {f['id']})" for f in folders[:10]])  # 最多显示10个
+        
+        if len(folders) > 10:
+            folder_list += f", ... and {len(folders) - 10} more folders"
+        
+        return f"Available root folders: {folder_list}. Use 'root' to list root directory contents, or use a folder_id to explore subfolders."
+    except Exception as e:
+        logger.warning(f"获取根目录文件夹失败: {e}")
+        return "Use 'root' for root directory, or a folder ID."
 
 
 def create_server() -> Server:
@@ -300,18 +685,54 @@ def create_server() -> Server:
 
     @server.list_tools()
     async def list_tools() -> ListToolsResult:
-        """列出可用工具"""
+        """列出可用工具 - 动态包含根目录文件夹信息"""
+        # 动态获取根目录文件夹描述
+        folder_description = await get_root_folders_description()
+        
         return ListToolsResult(
             tools=[
                 Tool(
+                    name="get_file_tree",
+                    description="Get a complete snapshot of the entire Google Drive file system structure as a tree. This is the BEST way to understand what files and folders exist. Returns a hierarchical tree view with all folders and files, including their IDs. Use this first to get a comprehensive overview before performing other operations.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "max_files": {
+                                "type": "integer",
+                                "description": "Maximum number of files to retrieve. Default is 500. Use smaller values for faster response.",
+                                "default": 500,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="list_folder",
+                    description="List files and subfolders in a specific Google Drive folder. Use get_file_tree first for a complete overview, then use this for exploring specific folders in detail.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "folder_id": {
+                                "type": "string",
+                                "description": folder_description,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
                     name="search",
-                    description="Search for files in Google Drive",
+                    description="Search for files in Google Drive by keywords. Can optionally limit search to a specific folder.",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Search query",
+                                "description": "Search keywords to find in file names and contents",
+                            },
+                            "folder_id": {
+                                "type": "string",
+                                "description": f"Optional: Limit search scope. {folder_description}",
                             },
                         },
                         "required": ["query"],
@@ -319,16 +740,107 @@ def create_server() -> Server:
                 ),
                 Tool(
                     name="read_file",
-                    description="Read the content of a file by its ID",
+                    description="Read the content of a file by its ID. Get file IDs from get_file_tree, list_folder, or search results.",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "file_id": {
                                 "type": "string",
-                                "description": "Google Drive file ID",
+                                "description": "Google Drive file ID (get this from get_file_tree, list_folder, or search results)",
                             },
                         },
                         "required": ["file_id"],
+                    },
+                ),
+                # ==================== 写入工具 ====================
+                Tool(
+                    name="create_file",
+                    description="Create a new file in Google Drive with the specified content.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "File name (e.g., 'notes.txt', 'data.json', 'readme.md')",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The text content to write to the file",
+                            },
+                            "folder_id": {
+                                "type": "string",
+                                "description": f"Optional: Parent folder ID. {folder_description}",
+                            },
+                        },
+                        "required": ["name", "content"],
+                    },
+                ),
+                Tool(
+                    name="update_file",
+                    description="Update the content of an existing file. Use this to modify files you've read or created.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "file_id": {
+                                "type": "string",
+                                "description": "Google Drive file ID to update",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The new content to write to the file",
+                            },
+                        },
+                        "required": ["file_id", "content"],
+                    },
+                ),
+                Tool(
+                    name="create_folder",
+                    description="Create a new folder in Google Drive.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Folder name",
+                            },
+                            "parent_folder_id": {
+                                "type": "string",
+                                "description": f"Optional: Parent folder ID. {folder_description}",
+                            },
+                        },
+                        "required": ["name"],
+                    },
+                ),
+                Tool(
+                    name="delete_file",
+                    description="Delete a file or folder by moving it to trash. This is reversible - files can be restored from trash.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "file_id": {
+                                "type": "string",
+                                "description": "Google Drive file or folder ID to delete",
+                            },
+                        },
+                        "required": ["file_id"],
+                    },
+                ),
+                Tool(
+                    name="move_file",
+                    description="Move a file or folder to a different location.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "file_id": {
+                                "type": "string",
+                                "description": "Google Drive file or folder ID to move",
+                            },
+                            "new_parent_id": {
+                                "type": "string",
+                                "description": f"Destination folder ID. {folder_description}",
+                            },
+                        },
+                        "required": ["file_id", "new_parent_id"],
                     },
                 ),
             ]
@@ -337,24 +849,114 @@ def create_server() -> Server:
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
         """执行工具调用"""
-        if name == "search":
+        if name == "get_file_tree":
+            max_files = arguments.get("max_files", 500)
+            
+            try:
+                result = await drive_client.get_file_tree(max_files=max_files)
+                tree = result["tree"]
+                stats = result["stats"]
+                
+                def format_tree(nodes: list, indent: str = "") -> list[str]:
+                    """格式化树状结构为文本"""
+                    lines = []
+                    for i, node in enumerate(nodes):
+                        is_last = i == len(nodes) - 1
+                        prefix = "└── " if is_last else "├── "
+                        
+                        if node["type"] == "folder":
+                            lines.append(f"{indent}{prefix}📁 {node['name']} [folder_id: {node['id']}]")
+                            if "children" in node and node["children"]:
+                                child_indent = indent + ("    " if is_last else "│   ")
+                                lines.extend(format_tree(node["children"], child_indent))
+                        else:
+                            size_info = f", {node.get('size', 'N/A')} bytes" if node.get('size') else ""
+                            lines.append(f"{indent}{prefix}📄 {node['name']} [file_id: {node['id']}]")
+                    return lines
+                
+                output_lines = [
+                    f"📊 Google Drive 文件系统快照",
+                    f"   总计: {stats['total_items']} 项 ({stats['folders']} 个文件夹, {stats['files']} 个文件)",
+                ]
+                if stats.get("truncated"):
+                    output_lines.append(f"   ⚠️ 结果已截断（达到 {max_files} 上限）")
+                output_lines.append("")
+                output_lines.append("📂 根目录")
+                output_lines.extend(format_tree(tree))
+                
+                return CallToolResult(
+                    content=[TextContent(type="text", text="\n".join(output_lines))]
+                )
+            except Exception as e:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"获取文件树失败: {e}")],
+                    isError=True,
+                )
+        
+        elif name == "list_folder":
+            folder_id = arguments.get("folder_id")
+            
+            try:
+                files = await drive_client.list_folder(folder_id)
+                
+                if not files:
+                    folder_desc = "根目录" if not folder_id or folder_id == "root" else f"文件夹 {folder_id}"
+                    return CallToolResult(
+                        content=[TextContent(type="text", text=f"{folder_desc} 是空的，没有文件或子文件夹。")]
+                    )
+                
+                # 分类显示：先文件夹，后文件
+                folders = [f for f in files if f.get("isFolder")]
+                regular_files = [f for f in files if not f.get("isFolder")]
+                
+                result_lines = []
+                folder_desc = "根目录" if not folder_id or folder_id == "root" else f"文件夹"
+                result_lines.append(f"📂 {folder_desc} 内容 ({len(files)} 项):\n")
+                
+                if folders:
+                    result_lines.append("📁 子文件夹:")
+                    for f in folders:
+                        result_lines.append(f"  - {f['name']} [folder_id: {f['id']}]")
+                    result_lines.append("")
+                
+                if regular_files:
+                    result_lines.append("📄 文件:")
+                    for f in regular_files:
+                        size = f.get('size', 'N/A')
+                        if size != 'N/A':
+                            size = f"{int(size):,} bytes"
+                        result_lines.append(f"  - {f['name']} ({f['mimeType']}) [file_id: {f['id']}]")
+                
+                return CallToolResult(
+                    content=[TextContent(type="text", text="\n".join(result_lines))]
+                )
+            except Exception as e:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"列出文件夹内容失败: {e}")],
+                    isError=True,
+                )
+        
+        elif name == "search":
             query = arguments.get("query", "")
-            files = await drive_client.search_files(query)
+            folder_id = arguments.get("folder_id")  # 新增：获取可选的folder_id参数
+            files = await drive_client.search_files(query, folder_id=folder_id)
 
             if not files:
+                scope = "整个 Google Drive" if not folder_id else f"文件夹 {folder_id}"
                 return CallToolResult(
-                    content=[TextContent(type="text", text="No files found.")]
+                    content=[TextContent(type="text", text=f"在 {scope} 中没有找到匹配的文件。")]
                 )
 
             file_list = "\n".join(
-                f"- {f['name']} ({f['mimeType']}) [ID: {f['id']}]"
+                f"- {f['name']} ({f['mimeType']}) [file_id: {f['id']}]"
                 for f in files
             )
+            scope = "整个 Drive" if not folder_id else f"文件夹 {folder_id}"
             return CallToolResult(
                 content=[
                     TextContent(
                         type="text",
-                        text=f"Found {len(files)} files:\n{file_list}",
+                        text=f"在 {scope} 中找到 {len(files)} 个文件:\n{file_list}",
                     )
                 ]
             )
@@ -380,6 +982,141 @@ def create_server() -> Server:
             except Exception as e:
                 return CallToolResult(
                     content=[TextContent(type="text", text=f"Error reading file: {e}")],
+                    isError=True,
+                )
+
+        # ==================== 写入工具处理 ====================
+        elif name == "create_file":
+            file_name = arguments.get("name", "")
+            content = arguments.get("content", "")
+            folder_id = arguments.get("folder_id")
+            
+            if not file_name:
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Error: name is required")],
+                    isError=True,
+                )
+            
+            try:
+                result = await drive_client.create_file(file_name, content, folder_id)
+                return CallToolResult(
+                    content=[TextContent(
+                        type="text",
+                        text=f"✅ 文件创建成功!\n"
+                             f"   名称: {result['name']}\n"
+                             f"   ID: {result['id']}\n"
+                             f"   类型: {result.get('mimeType', 'unknown')}\n"
+                             f"   链接: {result.get('webViewLink', 'N/A')}"
+                    )]
+                )
+            except Exception as e:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"创建文件失败: {e}")],
+                    isError=True,
+                )
+
+        elif name == "update_file":
+            file_id = arguments.get("file_id", "")
+            content = arguments.get("content", "")
+            
+            if not file_id:
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Error: file_id is required")],
+                    isError=True,
+                )
+            
+            try:
+                result = await drive_client.update_file(file_id, content)
+                return CallToolResult(
+                    content=[TextContent(
+                        type="text",
+                        text=f"✅ 文件更新成功!\n"
+                             f"   名称: {result['name']}\n"
+                             f"   ID: {result['id']}\n"
+                             f"   修改时间: {result.get('modifiedTime', 'unknown')}"
+                    )]
+                )
+            except Exception as e:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"更新文件失败: {e}")],
+                    isError=True,
+                )
+
+        elif name == "create_folder":
+            folder_name = arguments.get("name", "")
+            parent_folder_id = arguments.get("parent_folder_id")
+            
+            if not folder_name:
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Error: name is required")],
+                    isError=True,
+                )
+            
+            try:
+                result = await drive_client.create_folder(folder_name, parent_folder_id)
+                return CallToolResult(
+                    content=[TextContent(
+                        type="text",
+                        text=f"✅ 文件夹创建成功!\n"
+                             f"   名称: {result['name']}\n"
+                             f"   ID: {result['id']}\n"
+                             f"   链接: {result.get('webViewLink', 'N/A')}"
+                    )]
+                )
+            except Exception as e:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"创建文件夹失败: {e}")],
+                    isError=True,
+                )
+
+        elif name == "delete_file":
+            file_id = arguments.get("file_id", "")
+            
+            if not file_id:
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Error: file_id is required")],
+                    isError=True,
+                )
+            
+            try:
+                await drive_client.delete_file(file_id)
+                return CallToolResult(
+                    content=[TextContent(
+                        type="text",
+                        text=f"✅ 文件已移至回收站 (ID: {file_id})\n"
+                             f"   提示: 可在 Google Drive 回收站中恢复"
+                    )]
+                )
+            except Exception as e:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"删除文件失败: {e}")],
+                    isError=True,
+                )
+
+        elif name == "move_file":
+            file_id = arguments.get("file_id", "")
+            new_parent_id = arguments.get("new_parent_id", "")
+            
+            if not file_id or not new_parent_id:
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Error: file_id and new_parent_id are required")],
+                    isError=True,
+                )
+            
+            try:
+                result = await drive_client.move_file(file_id, new_parent_id)
+                return CallToolResult(
+                    content=[TextContent(
+                        type="text",
+                        text=f"✅ 文件移动成功!\n"
+                             f"   名称: {result['name']}\n"
+                             f"   ID: {result['id']}\n"
+                             f"   新位置: {new_parent_id}"
+                    )]
+                )
+            except Exception as e:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"移动文件失败: {e}")],
                     isError=True,
                 )
 
@@ -517,17 +1254,53 @@ async def run_server_http(host: str, port: int):
                         }
 
                 elif method == "tools/list":
+                    # 动态获取根目录文件夹描述
+                    folder_description = await get_root_folders_description()
+                    
                     result = {
                         "tools": [
                             {
+                                "name": "get_file_tree",
+                                "description": "Get a complete snapshot of the entire Google Drive file system structure as a tree. This is the BEST way to understand what files and folders exist. Returns a hierarchical tree view with all folders and files, including their IDs.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "max_files": {
+                                            "type": "integer",
+                                            "description": "Maximum number of files to retrieve. Default is 500.",
+                                            "default": 500,
+                                        },
+                                    },
+                                    "required": [],
+                                },
+                            },
+                            {
+                                "name": "list_folder",
+                                "description": "List files and subfolders in a specific Google Drive folder.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "folder_id": {
+                                            "type": "string",
+                                            "description": folder_description,
+                                        },
+                                    },
+                                    "required": [],
+                                },
+                            },
+                            {
                                 "name": "search",
-                                "description": "Search for files in Google Drive",
+                                "description": "Search for files in Google Drive by keywords. Can optionally limit search to a specific folder.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "query": {
                                             "type": "string",
-                                            "description": "Search query",
+                                            "description": "Search keywords to find in file names and contents",
+                                        },
+                                        "folder_id": {
+                                            "type": "string",
+                                            "description": f"Optional: Limit search scope. {folder_description}",
                                         },
                                     },
                                     "required": ["query"],
@@ -535,7 +1308,7 @@ async def run_server_http(host: str, port: int):
                             },
                             {
                                 "name": "read_file",
-                                "description": "Read the content of a file by its ID",
+                                "description": "Read the content of a file by its ID. Get file IDs from get_file_tree, list_folder, or search results.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -547,6 +1320,67 @@ async def run_server_http(host: str, port: int):
                                     "required": ["file_id"],
                                 },
                             },
+                            # 写入工具
+                            {
+                                "name": "create_file",
+                                "description": "Create a new file in Google Drive with the specified content.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string", "description": "File name"},
+                                        "content": {"type": "string", "description": "File content"},
+                                        "folder_id": {"type": "string", "description": f"Optional: Parent folder ID. {folder_description}"},
+                                    },
+                                    "required": ["name", "content"],
+                                },
+                            },
+                            {
+                                "name": "update_file",
+                                "description": "Update the content of an existing file.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file_id": {"type": "string", "description": "File ID to update"},
+                                        "content": {"type": "string", "description": "New content"},
+                                    },
+                                    "required": ["file_id", "content"],
+                                },
+                            },
+                            {
+                                "name": "create_folder",
+                                "description": "Create a new folder in Google Drive.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string", "description": "Folder name"},
+                                        "parent_folder_id": {"type": "string", "description": f"Optional: Parent folder. {folder_description}"},
+                                    },
+                                    "required": ["name"],
+                                },
+                            },
+                            {
+                                "name": "delete_file",
+                                "description": "Delete a file or folder (moves to trash).",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file_id": {"type": "string", "description": "File or folder ID to delete"},
+                                    },
+                                    "required": ["file_id"],
+                                },
+                            },
+                            {
+                                "name": "move_file",
+                                "description": "Move a file or folder to a different location.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file_id": {"type": "string", "description": "File or folder ID to move"},
+                                        "new_parent_id": {"type": "string", "description": f"Destination folder. {folder_description}"},
+                                    },
+                                    "required": ["file_id", "new_parent_id"],
+                                },
+                            },
                         ]
                     }
 
@@ -554,19 +1388,93 @@ async def run_server_http(host: str, port: int):
                     tool_name = params.get("name", "")
                     arguments = params.get("arguments", {})
 
-                    if tool_name == "search":
+                    if tool_name == "get_file_tree":
+                        max_files = arguments.get("max_files", 500)
+                        try:
+                            tree_result = await drive_client.get_file_tree(max_files=max_files)
+                            tree = tree_result["tree"]
+                            stats = tree_result["stats"]
+                            
+                            def format_tree(nodes: list, indent: str = "") -> list[str]:
+                                lines = []
+                                for i, node in enumerate(nodes):
+                                    is_last = i == len(nodes) - 1
+                                    prefix = "└── " if is_last else "├── "
+                                    if node["type"] == "folder":
+                                        lines.append(f"{indent}{prefix}📁 {node['name']} [folder_id: {node['id']}]")
+                                        if "children" in node and node["children"]:
+                                            child_indent = indent + ("    " if is_last else "│   ")
+                                            lines.extend(format_tree(node["children"], child_indent))
+                                    else:
+                                        lines.append(f"{indent}{prefix}📄 {node['name']} [file_id: {node['id']}]")
+                                return lines
+                            
+                            output_lines = [
+                                f"📊 Google Drive 文件系统快照",
+                                f"   总计: {stats['total_items']} 项 ({stats['folders']} 个文件夹, {stats['files']} 个文件)",
+                            ]
+                            if stats.get("truncated"):
+                                output_lines.append(f"   ⚠️ 结果已截断（达到 {max_files} 上限）")
+                            output_lines.append("")
+                            output_lines.append("📂 根目录")
+                            output_lines.extend(format_tree(tree))
+                            
+                            result = {"content": [{"type": "text", "text": "\n".join(output_lines)}]}
+                        except Exception as e:
+                            result = {
+                                "content": [{"type": "text", "text": f"获取文件树失败: {e}"}],
+                                "isError": True,
+                            }
+
+                    elif tool_name == "list_folder":
+                        folder_id = arguments.get("folder_id")
+                        try:
+                            files = await drive_client.list_folder(folder_id)
+                            if not files:
+                                folder_desc = "根目录" if not folder_id or folder_id == "root" else f"文件夹 {folder_id}"
+                                result = {"content": [{"type": "text", "text": f"{folder_desc} 是空的。"}]}
+                            else:
+                                folders = [f for f in files if f.get("isFolder")]
+                                regular_files = [f for f in files if not f.get("isFolder")]
+                                
+                                result_lines = []
+                                folder_desc = "根目录" if not folder_id or folder_id == "root" else "文件夹"
+                                result_lines.append(f"📂 {folder_desc} 内容 ({len(files)} 项):\n")
+                                
+                                if folders:
+                                    result_lines.append("📁 子文件夹:")
+                                    for f in folders:
+                                        result_lines.append(f"  - {f['name']} [folder_id: {f['id']}]")
+                                    result_lines.append("")
+                                
+                                if regular_files:
+                                    result_lines.append("📄 文件:")
+                                    for f in regular_files:
+                                        result_lines.append(f"  - {f['name']} ({f['mimeType']}) [file_id: {f['id']}]")
+                                
+                                result = {"content": [{"type": "text", "text": "\n".join(result_lines)}]}
+                        except Exception as e:
+                            result = {
+                                "content": [{"type": "text", "text": f"列出文件夹失败: {e}"}],
+                                "isError": True,
+                            }
+
+                    elif tool_name == "search":
                         query = arguments.get("query", "")
-                        files = await drive_client.search_files(query)
+                        folder_id = arguments.get("folder_id")
+                        files = await drive_client.search_files(query, folder_id=folder_id)
                         if not files:
-                            result = {"content": [{"type": "text", "text": "No files found."}]}
+                            scope = "整个 Drive" if not folder_id else f"文件夹 {folder_id}"
+                            result = {"content": [{"type": "text", "text": f"在 {scope} 中没有找到匹配的文件。"}]}
                         else:
                             file_list = "\n".join(
-                                f"- {f['name']} ({f['mimeType']}) [ID: {f['id']}]"
+                                f"- {f['name']} ({f['mimeType']}) [file_id: {f['id']}]"
                                 for f in files
                             )
+                            scope = "整个 Drive" if not folder_id else f"文件夹 {folder_id}"
                             result = {
                                 "content": [
-                                    {"type": "text", "text": f"Found {len(files)} files:\n{file_list}"}
+                                    {"type": "text", "text": f"在 {scope} 中找到 {len(files)} 个文件:\n{file_list}"}
                                 ]
                             }
 
@@ -587,6 +1495,67 @@ async def run_server_http(host: str, port: int):
                                     }
                                 ]
                             }
+
+                    # 写入工具处理
+                    elif tool_name == "create_file":
+                        file_name = arguments.get("name", "")
+                        content = arguments.get("content", "")
+                        folder_id = arguments.get("folder_id")
+                        if not file_name:
+                            result = {"content": [{"type": "text", "text": "Error: name is required"}], "isError": True}
+                        else:
+                            try:
+                                file_result = await drive_client.create_file(file_name, content, folder_id)
+                                result = {"content": [{"type": "text", "text": f"✅ 文件创建成功! 名称: {file_result['name']}, ID: {file_result['id']}"}]}
+                            except Exception as e:
+                                result = {"content": [{"type": "text", "text": f"创建文件失败: {e}"}], "isError": True}
+
+                    elif tool_name == "update_file":
+                        file_id = arguments.get("file_id", "")
+                        content = arguments.get("content", "")
+                        if not file_id:
+                            result = {"content": [{"type": "text", "text": "Error: file_id is required"}], "isError": True}
+                        else:
+                            try:
+                                file_result = await drive_client.update_file(file_id, content)
+                                result = {"content": [{"type": "text", "text": f"✅ 文件更新成功! 名称: {file_result['name']}, ID: {file_result['id']}"}]}
+                            except Exception as e:
+                                result = {"content": [{"type": "text", "text": f"更新文件失败: {e}"}], "isError": True}
+
+                    elif tool_name == "create_folder":
+                        folder_name = arguments.get("name", "")
+                        parent_id = arguments.get("parent_folder_id")
+                        if not folder_name:
+                            result = {"content": [{"type": "text", "text": "Error: name is required"}], "isError": True}
+                        else:
+                            try:
+                                folder_result = await drive_client.create_folder(folder_name, parent_id)
+                                result = {"content": [{"type": "text", "text": f"✅ 文件夹创建成功! 名称: {folder_result['name']}, ID: {folder_result['id']}"}]}
+                            except Exception as e:
+                                result = {"content": [{"type": "text", "text": f"创建文件夹失败: {e}"}], "isError": True}
+
+                    elif tool_name == "delete_file":
+                        file_id = arguments.get("file_id", "")
+                        if not file_id:
+                            result = {"content": [{"type": "text", "text": "Error: file_id is required"}], "isError": True}
+                        else:
+                            try:
+                                await drive_client.delete_file(file_id)
+                                result = {"content": [{"type": "text", "text": f"✅ 文件已移至回收站 (ID: {file_id})"}]}
+                            except Exception as e:
+                                result = {"content": [{"type": "text", "text": f"删除文件失败: {e}"}], "isError": True}
+
+                    elif tool_name == "move_file":
+                        file_id = arguments.get("file_id", "")
+                        new_parent_id = arguments.get("new_parent_id", "")
+                        if not file_id or not new_parent_id:
+                            result = {"content": [{"type": "text", "text": "Error: file_id and new_parent_id are required"}], "isError": True}
+                        else:
+                            try:
+                                move_result = await drive_client.move_file(file_id, new_parent_id)
+                                result = {"content": [{"type": "text", "text": f"✅ 文件移动成功! 名称: {move_result['name']}"}]}
+                            except Exception as e:
+                                result = {"content": [{"type": "text", "text": f"移动文件失败: {e}"}], "isError": True}
 
                     else:
                         result = {
