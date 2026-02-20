@@ -10,7 +10,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: gdrive-mcp-server
-    restart: unless-stopped
+    restart: on-failure
     
     ports:
       - "8010:8000"
@@ -20,6 +20,8 @@ services:
       # 本地先运行 auth 生成凭证，再启动容器
       - ./config:/config
     
+    env_file:
+      - .env
     environment:
       - GDRIVE_CREDS_DIR=/config
       - PORT=8000

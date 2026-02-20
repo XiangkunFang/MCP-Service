@@ -61,12 +61,21 @@ CREDENTIALS_DIR = Path(os.getenv("GDRIVE_CREDS_DIR", Path.home() / ".config" / "
 OAUTH_KEYS_FILE = CREDENTIALS_DIR / "gcp-oauth.keys.json"
 CREDENTIALS_FILE = CREDENTIALS_DIR / "credentials.json"
 
+# 可选：将 MCP 限定到指定文件夹，所有操作仅在该文件夹及其子文件夹内生效
+# 设置为 Google Drive 文件夹 ID（从分享链接或 get_file_tree 中获取），不设置则使用整个 Drive 根目录
+GDRIVE_ROOT_FOLDER_ID = os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip() or None
+
 
 class GoogleDriveClient:
     """Google Drive API 客户端封装"""
 
     def __init__(self):
         self.service = None
+        self.root_folder_id = GDRIVE_ROOT_FOLDER_ID  # 限定根目录，None 表示整个 Drive
+
+    def _effective_root(self) -> str:
+        """当前生效的「根目录」ID：若配置了 GDRIVE_ROOT_FOLDER_ID 则用该文件夹，否则用 Drive 的 root"""
+        return self.root_folder_id if self.root_folder_id else "root"
 
     def authenticate(self) -> bool:
         """加载或刷新凭证"""
@@ -166,8 +175,8 @@ class GoogleDriveClient:
             f.write(creds.to_json())
         logger.info(f"凭证已保存到: {CREDENTIALS_FILE}")
 
-    async def list_files(self, page_token: str | None = None, page_size: int = 10) -> dict:
-        """列出文件"""
+    async def list_files(self, page_token: str | None = None, page_size: int = 10, folder_id: str | None = None) -> dict:
+        """列出文件。folder_id 传 None 且未配置 GDRIVE_ROOT_FOLDER_ID 时列整个 Drive；否则只列指定/配置的文件夹下"""
         try:
             params = {
                 "pageSize": page_size,
@@ -175,7 +184,10 @@ class GoogleDriveClient:
             }
             if page_token:
                 params["pageToken"] = page_token
-
+            # 仅当限定根目录或显式传入 folder_id 时按「某文件夹下」过滤
+            if folder_id is not None or self.root_folder_id:
+                parent_id = folder_id if folder_id is not None else self._effective_root()
+                params["q"] = f"'{parent_id}' in parents and trashed = false"
             result = self.service.files().list(**params).execute()
             return result
         except HttpError as e:
@@ -194,9 +206,10 @@ class GoogleDriveClient:
             文件列表，每个文件包含 id, name, mimeType, 以及是否为文件夹的标识
         """
         try:
-            # 如果没有指定folder_id或为"root"，则列出根目录
+            # 如果没有指定 folder_id 或为 "root"，则列出当前生效的根目录（可能为配置的限定文件夹）
             if not folder_id or folder_id == "root":
-                query = "'root' in parents and trashed = false"
+                root_id = self._effective_root()
+                query = f"'{root_id}' in parents and trashed = false"
             else:
                 query = f"'{folder_id}' in parents and trashed = false"
             
@@ -287,9 +300,41 @@ class GoogleDriveClient:
             return mime_type, base64.b64encode(result).decode("utf-8")
         return mime_type, result
 
+    async def _get_file_tree_from_folder(self, folder_id: str, max_files: int, _collected: list) -> list:
+        """
+        从指定文件夹起递归构建树（用于限定根目录时的 get_file_tree）。
+        _collected 用于累计已收集文件数并受 max_files 限制。
+        """
+        if len(_collected) >= max_files:
+            return []
+        children = await self.list_folder(folder_id=folder_id, page_size=max_files - len(_collected))
+        if not children:
+            return []
+        nodes = []
+        for f in sorted(children, key=lambda x: (not x.get("isFolder"), x.get("name", ""))):
+            if len(_collected) >= max_files:
+                break
+            _collected.append(f)
+            node = {
+                "name": f["name"],
+                "id": f["id"],
+                "type": "folder" if f.get("isFolder") else "file",
+            }
+            if not f.get("isFolder"):
+                node["mimeType"] = f.get("mimeType", "unknown")
+                if f.get("size"):
+                    node["size"] = f["size"]
+            if f.get("isFolder"):
+                node["children"] = await self._get_file_tree_from_folder(f["id"], max_files, _collected)
+            else:
+                node["children"] = []
+            nodes.append(node)
+        return nodes
+
     async def get_file_tree(self, max_files: int = 500) -> dict:
         """
-        获取完整的文件系统树状结构快照
+        获取完整的文件系统树状结构快照。
+        若配置了 GDRIVE_ROOT_FOLDER_ID，则只返回该文件夹及其子项；否则返回整个 Drive。
         
         Args:
             max_files: 最大获取文件数（避免超大Drive耗时过长）
@@ -298,9 +343,30 @@ class GoogleDriveClient:
             树状结构的字典，包含完整的目录层级
         """
         try:
+            # 限定根目录时：只从该文件夹递归构建树
+            if self.root_folder_id:
+                root_info = self.service.files().get(
+                    fileId=self.root_folder_id,
+                    fields="id, name, mimeType"
+                ).execute()
+                root_name = root_info.get("name", "根目录")
+                _collected = []
+                tree = await self._get_file_tree_from_folder(self.root_folder_id, max_files, _collected)
+                folder_count = sum(1 for n in _collected if n.get("mimeType") == "application/vnd.google-apps.folder")
+                file_count = len(_collected) - folder_count
+                return {
+                    "tree": [{"name": root_name, "id": self.root_folder_id, "type": "folder", "children": tree}],
+                    "stats": {
+                        "total_items": len(_collected) + 1,
+                        "folders": folder_count + 1,
+                        "files": file_count,
+                        "truncated": len(_collected) >= max_files,
+                    }
+                }
+
             all_files = []
             page_token = None
-            
+
             # 获取所有文件和文件夹（包含parents信息）
             while len(all_files) < max_files:
                 params = {
@@ -310,45 +376,39 @@ class GoogleDriveClient:
                 }
                 if page_token:
                     params["pageToken"] = page_token
-                
+
                 result = self.service.files().list(**params).execute()
                 files = result.get("files", [])
                 all_files.extend(files)
-                
+
                 page_token = result.get("nextPageToken")
                 if not page_token:
                     break
-            
+
             # 构建 id -> file 的映射
             file_map = {f["id"]: f for f in all_files}
-            
+
             # 构建树状结构
             root_children = []
             children_map = {}  # parent_id -> [children]
-            
+
             for f in all_files:
                 f["isFolder"] = f.get("mimeType") == "application/vnd.google-apps.folder"
                 parents = f.get("parents", [])
-                
+
                 if not parents or "root" in [p for p in parents if p not in file_map]:
-                    # 没有父文件夹，或父文件夹是root
                     root_children.append(f)
                 else:
-                    # 有父文件夹
                     for parent_id in parents:
                         if parent_id not in children_map:
                             children_map[parent_id] = []
                         children_map[parent_id].append(f)
-            
+
             def build_tree(file_list: list, depth: int = 0, max_depth: int = 10) -> list:
-                """递归构建树"""
                 if depth > max_depth:
                     return []
-                
                 result = []
-                # 先排序：文件夹优先，然后按名称
                 sorted_files = sorted(file_list, key=lambda x: (not x.get("isFolder"), x.get("name", "")))
-                
                 for f in sorted_files:
                     node = {
                         "name": f["name"],
@@ -359,21 +419,15 @@ class GoogleDriveClient:
                         node["mimeType"] = f.get("mimeType", "unknown")
                         if f.get("size"):
                             node["size"] = f["size"]
-                    
-                    # 如果是文件夹，递归获取子项
                     if f.get("isFolder") and f["id"] in children_map:
                         node["children"] = build_tree(children_map[f["id"]], depth + 1, max_depth)
-                    
                     result.append(node)
-                
                 return result
-            
+
             tree = build_tree(root_children)
-            
-            # 统计信息
             folder_count = sum(1 for f in all_files if f.get("isFolder"))
             file_count = len(all_files) - folder_count
-            
+
             return {
                 "tree": tree,
                 "stats": {
@@ -383,7 +437,7 @@ class GoogleDriveClient:
                     "truncated": len(all_files) >= max_files,
                 }
             }
-            
+
         except HttpError as e:
             logger.error(f"获取文件树失败: {e}")
             raise
@@ -394,10 +448,12 @@ class GoogleDriveClient:
         
         Args:
             query: 搜索关键词
-            folder_id: 可选，限制搜索范围到指定文件夹
+            folder_id: 可选，限制搜索范围到指定文件夹；未指定且配置了 GDRIVE_ROOT_FOLDER_ID 时限定在该文件夹内
             page_size: 返回的最大文件数
         """
         try:
+            if folder_id is None and self.root_folder_id:
+                folder_id = self.root_folder_id
             # 转义查询字符串
             escaped_query = query.replace("\\", "\\\\").replace("'", "\\'")
             formatted_query = f"fullText contains '{escaped_query}'"
@@ -439,6 +495,8 @@ class GoogleDriveClient:
         try:
             from googleapiclient.http import MediaInMemoryUpload
             
+            if folder_id is None and self.root_folder_id:
+                folder_id = self.root_folder_id
             file_metadata = {"name": name}
             if folder_id and folder_id != "root":
                 file_metadata["parents"] = [folder_id]
@@ -521,6 +579,8 @@ class GoogleDriveClient:
             创建的文件夹信息
         """
         try:
+            if parent_folder_id is None and self.root_folder_id:
+                parent_folder_id = self.root_folder_id
             file_metadata = {
                 "name": name,
                 "mimeType": "application/vnd.google-apps.folder"
@@ -603,23 +663,26 @@ drive_client = GoogleDriveClient()
 
 async def get_root_folders_description() -> str:
     """
-    获取根目录文件夹列表，用于动态生成 inputSchema 的 description
-    这样 LLM 在获取工具列表时就能直接看到可用的文件夹
+    获取根目录文件夹列表，用于动态生成 inputSchema 的 description。
+    若配置了 GDRIVE_ROOT_FOLDER_ID，则描述为「当前 MCP 限定在该文件夹内」并列出其子文件夹。
     """
     try:
-        files = await drive_client.list_folder(folder_id="root")
+        root_id = drive_client._effective_root()
+        files = await drive_client.list_folder(folder_id=root_id)
         folders = [f for f in files if f.get("isFolder")]
-        
+
+        if drive_client.root_folder_id:
+            scope_note = "This MCP is scoped to a single folder (not entire Drive). "
+        else:
+            scope_note = ""
+
         if not folders:
-            return "Use 'root' for root directory, or omit to list root."
-        
-        # 构建文件夹列表描述
-        folder_list = ", ".join([f"'{f['name']}' (id: {f['id']})" for f in folders[:10]])  # 最多显示10个
-        
+            return f"{scope_note}Use 'root' for root directory, or omit to list root."
+
+        folder_list = ", ".join([f"'{f['name']}' (id: {f['id']})" for f in folders[:10]])
         if len(folders) > 10:
             folder_list += f", ... and {len(folders) - 10} more folders"
-        
-        return f"Available root folders: {folder_list}. Use 'root' to list root directory contents, or use a folder_id to explore subfolders."
+        return f"{scope_note}Available root folders: {folder_list}. Use 'root' to list root contents, or use a folder_id to explore subfolders."
     except Exception as e:
         logger.warning(f"获取根目录文件夹失败: {e}")
         return "Use 'root' for root directory, or a folder ID."
@@ -880,8 +943,10 @@ def create_server() -> Server:
                 ]
                 if stats.get("truncated"):
                     output_lines.append(f"   ⚠️ 结果已截断（达到 {max_files} 上限）")
+                if drive_client.root_folder_id:
+                    output_lines.append("   📌 当前 MCP 限定在下方该文件夹内")
                 output_lines.append("")
-                output_lines.append("📂 根目录")
+                output_lines.append("📂 根目录" + (" (限定)" if drive_client.root_folder_id else ""))
                 output_lines.extend(format_tree(tree))
                 
                 return CallToolResult(
@@ -1415,8 +1480,10 @@ async def run_server_http(host: str, port: int):
                             ]
                             if stats.get("truncated"):
                                 output_lines.append(f"   ⚠️ 结果已截断（达到 {max_files} 上限）")
+                            if drive_client.root_folder_id:
+                                output_lines.append("   📌 当前 MCP 限定在下方该文件夹内")
                             output_lines.append("")
-                            output_lines.append("📂 根目录")
+                            output_lines.append("📂 根目录" + (" (限定)" if drive_client.root_folder_id else ""))
                             output_lines.extend(format_tree(tree))
                             
                             result = {"content": [{"type": "text", "text": "\n".join(output_lines)}]}
@@ -1608,6 +1675,8 @@ async def run_server_http(host: str, port: int):
     )
 
     logger.info(f"启动 Google Drive MCP Server (HTTP 模式) - http://{host}:{port}")
+    if drive_client.root_folder_id:
+        logger.info(f"  - 📌 已限定根目录 (GDRIVE_ROOT_FOLDER_ID)，仅在该文件夹内操作")
     logger.info(f"  - 健康检查: http://{host}:{port}/health")
     logger.info(f"  - MCP 端点: http://{host}:{port}/mcp")
     logger.info(f"  - SSE 端点: http://{host}:{port}/sse")
