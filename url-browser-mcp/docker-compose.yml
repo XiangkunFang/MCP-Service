@@ -1,0 +1,35 @@
+# ===========================================
+# URL Browser MCP Server - Docker Compose
+# ===========================================
+
+version: '3.8'
+
+services:
+  url-browser-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: url-browser-mcp-server
+    restart: unless-stopped
+
+    ports:
+      - "8020:8000"
+
+    environment:
+      - PORT=8000
+      - URL_BROWSER_TIMEOUT=30
+      - URL_BROWSER_MAX_LENGTH=500000
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # 可选：日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

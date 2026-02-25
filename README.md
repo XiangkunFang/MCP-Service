@@ -7,6 +7,7 @@
 | 服务 | 描述 | 状态 |
 |------|------|------|
 | [gdrive-mcp](./gdrive-mcp/) | Google Drive MCP Server - 支持读取、搜索 Google Drive 文件 | ✅ 可用 |
+| [url-browser-mcp](./url-browser-mcp/) | URL Browser MCP Server - 浏览任意 URL，读取网页内容 | ✅ 可用 |
 
 ## 目录结构
 
@@ -14,6 +15,11 @@
 mcp-servers/
 ├── gdrive-mcp/          # Google Drive MCP Server
 │   ├── gdrive_mcp_server.py
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── README.md
+├── url-browser-mcp/     # URL Browser MCP Server
+│   ├── url_browser_mcp_server.py
 │   ├── Dockerfile
 │   ├── docker-compose.yml
 │   └── README.md
